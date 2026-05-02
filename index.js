@@ -18,32 +18,43 @@ const fs      = require('fs');
 
 const CONFIG = {
     allowedNumbers: [
-        '51933747910',  // +51 933 747 910
-        '51956274174',  // +51 956 274 174
-        '51976696005',  // +51 976 696 005
-        '491623796316', // +49 162 3796316
+        '51933747910',
+        '51956274174',
+        '51976696005',
+        '491623796316',
     ],
-    maxMessages:  20,
-    port:         process.env.PORT || 3000,
-    authFolder:   './auth_session',
-    logLevel:     process.env.LOG_LEVEL || 'info',
+    maxMessagesPerChat: 50,
+    port:      process.env.PORT || 3000,
+    authFolder:'./auth_session',
+    logLevel:  process.env.LOG_LEVEL || 'info',
 };
 
 // ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 
+/**
+ * chats = {
+ *   '51933747910': {
+ *     number: '51933747910',
+ *     name: 'Sandry',
+ *     unread: 2,
+ *     messages: [ { id, text, ts, fromMe } ]
+ *   }, ...
+ * }
+ */
+const chats = {};
+let   globalMsgId = 0;
+
+// Cola plana (compatibilidad con sketch anterior)
 const messageQueue = [];
-let lastMessageId  = 0;
-let currentQR      = null;
+let   lastMessageId = 0;
+let   currentQR     = null;
 
 // ─── LOGGER ───────────────────────────────────────────────────────────────────
 
-const logger = pino(
-    { level: CONFIG.logLevel },
-    pino.destination(1)
-);
+const logger       = pino({ level: CONFIG.logLevel }, pino.destination(1));
 const silentLogger = pino({ level: 'silent' });
 
-// ─── MAPA LID → número ────────────────────────────────────────────────────────
+// ─── MAPA LID ─────────────────────────────────────────────────────────────────
 const lidToNumber = new Map();
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -65,132 +76,149 @@ function extractText(msg) {
     );
 }
 
-function enqueue(entry) {
-    lastMessageId += 1;
-    messageQueue.push({ id: lastMessageId, ...entry });
-    if (messageQueue.length > CONFIG.maxMessages) messageQueue.shift();
-    logger.info({ from: entry.from, text: entry.text.slice(0, 60) }, 'Mensaje encolado');
+function addToChat(number, name, text, ts, fromMe) {
+    if (!chats[number]) {
+        chats[number] = { number, name, unread: 0, messages: [] };
+    }
+    const chat = chats[number];
+    // Actualizar nombre si viene nuevo
+    if (name && name !== number) chat.name = name;
+
+    globalMsgId += 1;
+    chat.messages.push({ id: globalMsgId, text, ts, fromMe: fromMe || false });
+
+    // Recortar historial
+    if (chat.messages.length > CONFIG.maxMessagesPerChat) {
+        chat.messages.shift();
+    }
+
+    if (!fromMe) {
+        chat.unread += 1;
+        // Cola plana (para el sketch viejo)
+        lastMessageId += 1;
+        messageQueue.push({ id: lastMessageId, from: number, name: chat.name, text, ts });
+        if (messageQueue.length > 20) messageQueue.shift();
+    }
+
+    logger.info({ number, fromMe, text: text.slice(0, 50) }, 'Mensaje');
 }
 
-// ─── SERVIDOR EXPRESS ─────────────────────────────────────────────────────────
+// ─── EXPRESS ──────────────────────────────────────────────────────────────────
 
 const app = express();
 
+// ── /messages (compatibilidad sketch anterior) ──
 app.get('/messages', (req, res) => {
     const since = parseInt(req.query.since) || 0;
-    const msgs  = messageQueue.filter(m => m.id > since);
-    res.json({ count: msgs.length, messages: msgs });
+    res.json({ count: messageQueue.filter(m => m.id > since).length,
+        messages: messageQueue.filter(m => m.id > since) });
 });
 
+// ── /chats — lista de conversaciones ──
+app.get('/chats', (req, res) => {
+    const list = Object.values(chats).map(c => ({
+        number:   c.number,
+        name:     c.name,
+        unread:   c.unread,
+        lastText: c.messages.length > 0 ? c.messages[c.messages.length - 1].text : '',
+        lastTs:   c.messages.length > 0 ? c.messages[c.messages.length - 1].ts  : 0,
+    }));
+    list.sort((a, b) => b.lastTs - a.lastTs);
+    res.json({ count: list.length, chats: list });
+});
+
+// ── /chats/:number — historial ──
+app.get('/chats/:number', (req, res) => {
+    const num   = req.params.number;
+    const limit = parseInt(req.query.limit) || 30;
+    if (!chats[num]) return res.json({ number: num, name: num, unread: 0, messages: [] });
+    const chat = chats[num];
+    chats[num].unread = 0;
+    res.json({ number: chat.number, name: chat.name, unread: 0,
+        messages: chat.messages.slice(-limit) });
+});
+
+// ── /status ──
 app.get('/status', (req, res) => {
-    res.json({
-        connected:      global.waConnected || false,
-        queueLength:    messageQueue.length,
-        lastMessageId,
-        allowedNumbers: CONFIG.allowedNumbers,
-    });
+    res.json({ connected: global.waConnected || false,
+        chats: Object.keys(chats).length, lastMessageId,
+        allowedNumbers: CONFIG.allowedNumbers });
 });
 
+// ── /clear ──
 app.get('/clear', (req, res) => {
+    Object.keys(chats).forEach(k => delete chats[k]);
     messageQueue.length = 0;
     lastMessageId = 0;
     res.json({ ok: true });
 });
 
+// ── /health ──
 app.get('/health', (req, res) => {
-    res.json({
-        status:    'ok',
-        uptime:    Math.floor(process.uptime()),
-        connected: global.waConnected || false,
-    });
+    res.json({ status: 'ok', uptime: Math.floor(process.uptime()),
+        connected: global.waConnected || false });
 });
 
+// ── /qr ──
 app.get('/qr', async (req, res) => {
-    if (global.waConnected) {
-        return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>✅ Ya conectado a WhatsApp</h2></body></html>');
-    }
-    if (!currentQR) {
-        return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>⏳ QR aún no disponible. Espera unos segundos y recarga.</h2></body></html>');
-    }
-    try {
-        const img = await QRCode.toDataURL(currentQR);
-        res.send(`
-            <html>
-            <head><meta http-equiv="refresh" content="30"></head>
-            <body style="background:#111;display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;margin:0">
-                <p style="color:#fff;font-family:sans-serif;margin-bottom:16px">Escanea con WhatsApp → Dispositivos vinculados → Vincular dispositivo</p>
-                <img src="${img}" style="width:280px;height:280px"/>
-                <p style="color:#888;font-family:sans-serif;font-size:12px;margin-top:12px">La página se recarga automáticamente cada 30s</p>
-            </body>
-            </html>
-        `);
-    } catch (e) {
-        res.status(500).send('Error generando QR');
-    }
+    if (global.waConnected)
+        return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>✅ Ya conectado</h2></body></html>');
+    if (!currentQR)
+        return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>⏳ QR no disponible aún, recarga en unos segundos</h2></body></html>');
+    const img = await QRCode.toDataURL(currentQR);
+    res.send(`<html><head><meta http-equiv="refresh" content="30"></head>
+        <body style="background:#111;display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;margin:0">
+        <p style="color:#fff;font-family:sans-serif;margin-bottom:16px">Escanea con WhatsApp → Dispositivos vinculados</p>
+        <img src="${img}" style="width:280px;height:280px"/>
+        </body></html>`);
 });
 
-app.listen(CONFIG.port, () => {
-    logger.info(`Servidor HTTP escuchando en puerto ${CONFIG.port}`);
-});
+app.listen(CONFIG.port, () => logger.info(`Puerto ${CONFIG.port}`));
 
 // ─── BAILEYS ──────────────────────────────────────────────────────────────────
 
 async function connectToWhatsApp() {
-    if (!fs.existsSync(CONFIG.authFolder)) {
+    if (!fs.existsSync(CONFIG.authFolder))
         fs.mkdirSync(CONFIG.authFolder, { recursive: true });
-    }
 
     const { state, saveCreds } = await useMultiFileAuthState(CONFIG.authFolder);
     const { version }          = await fetchLatestBaileysVersion();
-
-    logger.info({ version }, 'Versión de WhatsApp Web');
+    logger.info({ version }, 'WhatsApp Web version');
 
     const sock = makeWASocket({
-        version,
-        logger:              silentLogger,
-        printQRInTerminal:   false,
-        auth: {
-            creds: state.creds,
-            keys:  makeCacheableSignalKeyStore(state.keys, silentLogger),
-        },
-        syncFullHistory:     false,
-        markOnlineOnConnect: false,
+        version, logger: silentLogger, printQRInTerminal: false,
+        auth: { creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, silentLogger) },
+        syncFullHistory: false, markOnlineOnConnect: false,
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('contacts.upsert', (contacts) => {
-        for (const c of contacts) {
-            if (c.lid && c.id) {
+        for (const c of contacts)
+            if (c.lid && c.id)
                 lidToNumber.set(c.lid.split('@')[0], c.id.split('@')[0]);
-            }
-        }
     });
 
     sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
         if (qr) {
             currentQR = qr;
-            logger.info('QR listo → visita /qr en el navegador para escanearlo');
+            logger.info('QR listo → /qr');
             qrcode.generate(qr, { small: true });
         }
-
         if (connection === 'open') {
-            currentQR          = null;
-            global.waConnected = true;
-            logger.info('✅ Conectado a WhatsApp');
+            currentQR = null; global.waConnected = true;
+            logger.info('✅ Conectado');
         }
-
         if (connection === 'close') {
             global.waConnected = false;
-            const code            = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = code !== DisconnectReason.loggedOut;
-            logger.warn({ code }, 'Conexión cerrada');
-
-            if (shouldReconnect) {
-                logger.info('Reconectando en 5 s...');
+            const code = lastDisconnect?.error?.output?.statusCode;
+            logger.warn({ code }, 'Desconectado');
+            if (code !== DisconnectReason.loggedOut) {
+                logger.info('Reconectando en 5s...');
                 setTimeout(connectToWhatsApp, 5000);
             } else {
-                logger.error('Sesión cerrada (logout). Borra auth_session/ y vuelve a escanear el QR.');
+                logger.error('Logout — borra auth_session/ y re-escanea QR');
             }
         }
     });
@@ -199,23 +227,20 @@ async function connectToWhatsApp() {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
-            if (msg.key.fromMe) continue;
-
             let jid = msg.key.remoteJid;
 
+            // Resolver LID
             if (jid.endsWith('@lid')) {
                 const senderPn = msg.key.senderPn;
-                if (senderPn) {
-                    jid = senderPn;
-                } else {
+                if (senderPn) { jid = senderPn; }
+                else {
                     const mapped = lidToNumber.get(jid.split('@')[0]);
                     if (!mapped) continue;
                     jid = mapped + '@s.whatsapp.net';
                 }
             }
 
-            if (jid.endsWith('@g.us'))      continue;
-            if (jid.endsWith('@broadcast')) continue;
+            if (jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
 
             const number = jidToNumber(jid);
             if (!CONFIG.allowedNumbers.includes(number)) continue;
@@ -223,12 +248,11 @@ async function connectToWhatsApp() {
             const text = extractText(msg);
             if (!text) continue;
 
-            enqueue({
-                from: number,
-                name: msg.pushName || number,
-                text,
-                ts:   Math.floor(msg.messageTimestamp || Date.now() / 1000),
-            });
+            const ts     = Math.floor(msg.messageTimestamp || Date.now() / 1000);
+            const fromMe = msg.key.fromMe || false;
+            const name   = msg.pushName || number;
+
+            addToChat(number, name, text, ts, fromMe);
         }
     });
 
@@ -236,6 +260,6 @@ async function connectToWhatsApp() {
 }
 
 connectToWhatsApp().catch(err => {
-    logger.error(err, 'Error fatal al conectar');
+    logger.error(err, 'Error fatal');
     process.exit(1);
 });

@@ -22,6 +22,7 @@ const CONFIG = {
         '51956274174',
         '51976696005',
         '491623796316',
+        '51906782128',
     ],
     maxMessagesPerChat: 50,
     port:      process.env.PORT || 3000,
@@ -78,23 +79,22 @@ function extractText(msg) {
 
 function addToChat(number, name, text, ts, fromMe) {
     if (!chats[number]) {
-        chats[number] = { number, name, unread: 0, messages: [] };
+        // Al crear el chat, solo usar el nombre si es un mensaje recibido
+        chats[number] = { number, name: (!fromMe && name) ? name : number, unread: 0, messages: [] };
     }
     const chat = chats[number];
-    // Actualizar nombre si viene nuevo
-    if (name && name !== number) chat.name = name;
+    // Actualizar nombre solo con mensajes recibidos
+    if (!fromMe && name && name !== number) chat.name = name;
 
     globalMsgId += 1;
     chat.messages.push({ id: globalMsgId, text, ts, fromMe: fromMe || false });
 
-    // Recortar historial
     if (chat.messages.length > CONFIG.maxMessagesPerChat) {
         chat.messages.shift();
     }
 
     if (!fromMe) {
         chat.unread += 1;
-        // Cola plana (para el sketch viejo)
         lastMessageId += 1;
         messageQueue.push({ id: lastMessageId, from: number, name: chat.name, text, ts });
         if (messageQueue.length > 20) messageQueue.shift();
@@ -224,6 +224,10 @@ async function connectToWhatsApp() {
     });
 
     sock.ev.on('messages.upsert', ({ messages, type }) => {
+        console.log('>>> upsert:', type);
+        for (const m of messages) {
+            console.log('>>> key completo:', JSON.stringify(m.key, null, 2));
+        }
         if (type !== 'notify') return;
 
         for (const msg of messages) {
@@ -231,8 +235,8 @@ async function connectToWhatsApp() {
 
             // Resolver LID
             if (jid.endsWith('@lid')) {
-                const senderPn = msg.key.senderPn;
-                if (senderPn) { jid = senderPn; }
+                const alt = msg.key.remoteJidAlt || msg.key.senderPn;
+                if (alt) { jid = alt; }
                 else {
                     const mapped = lidToNumber.get(jid.split('@')[0]);
                     if (!mapped) continue;

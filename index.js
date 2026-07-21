@@ -173,7 +173,7 @@ app.get('/qr', async (req, res) => {
         </body></html>`);
 });
 
-app.listen(CONFIG.port, () => logger.info(`Puerto ${CONFIG.port}`));
+app.listen(CONFIG.port, '0.0.0.0', () => logger.info(`Puerto ${CONFIG.port}`));
 
 // ─── BAILEYS ──────────────────────────────────────────────────────────────────
 

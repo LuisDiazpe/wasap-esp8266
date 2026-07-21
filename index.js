@@ -13,6 +13,9 @@ const qrcode  = require('qrcode-terminal');
 const QRCode  = require('qrcode');
 const pino    = require('pino');
 const fs      = require('fs');
+const { spawn } = require('child_process');
+const os      = require('os');
+const path    = require('path');
 
 // ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
 
@@ -32,23 +35,13 @@ const CONFIG = {
 
 // ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 
-/**
- * chats = {
- *   '51933747910': {
- *     number: '51933747910',
- *     name: 'Sandry',
- *     unread: 2,
- *     messages: [ { id, text, ts, fromMe } ]
- *   }, ...
- * }
- */
 const chats = {};
 let   globalMsgId = 0;
 
-// Cola plana (compatibilidad con sketch anterior)
 const messageQueue = [];
 let   lastMessageId = 0;
 let   currentQR     = null;
+let   sockRef       = null;   // referencia al socket de Baileys para enviar
 
 // ─── LOGGER ───────────────────────────────────────────────────────────────────
 
@@ -79,11 +72,9 @@ function extractText(msg) {
 
 function addToChat(number, name, text, ts, fromMe) {
     if (!chats[number]) {
-        // Al crear el chat, solo usar el nombre si es un mensaje recibido
         chats[number] = { number, name: (!fromMe && name) ? name : number, unread: 0, messages: [] };
     }
     const chat = chats[number];
-    // Actualizar nombre solo con mensajes recibidos
     if (!fromMe && name && name !== number) chat.name = name;
 
     globalMsgId += 1;
@@ -103,18 +94,65 @@ function addToChat(number, name, text, ts, fromMe) {
     logger.info({ number, fromMe, text: text.slice(0, 50) }, 'Mensaje');
 }
 
+/**
+ * Convierte un buffer WAV a OGG/Opus usando ffmpeg (formato de nota de voz de WhatsApp)
+ * Devuelve una Promise con el buffer OGG.
+ */
+function wavToOpus(wavBuffer) {
+    return new Promise((resolve, reject) => {
+        const inPath  = path.join(os.tmpdir(), `audio_${Date.now()}.wav`);
+        const outPath = path.join(os.tmpdir(), `audio_${Date.now()}.ogg`);
+
+        fs.writeFileSync(inPath, wavBuffer);
+
+        // ffmpeg -i in.wav -c:a libopus -b:a 24k -ar 48000 -ac 1 out.ogg
+        const ff = spawn('ffmpeg', [
+            '-y',
+            '-i', inPath,
+            '-c:a', 'libopus',
+            '-b:a', '24k',
+            '-ar', '48000',
+            '-ac', '1',
+            outPath,
+        ]);
+
+        let stderr = '';
+        ff.stderr.on('data', d => { stderr += d.toString(); });
+
+        ff.on('close', code => {
+            try { fs.unlinkSync(inPath); } catch (e) {}
+            if (code !== 0) {
+                try { fs.unlinkSync(outPath); } catch (e) {}
+                return reject(new Error('ffmpeg falló: ' + stderr.slice(-500)));
+            }
+            try {
+                const ogg = fs.readFileSync(outPath);
+                fs.unlinkSync(outPath);
+                resolve(ogg);
+            } catch (e) {
+                reject(e);
+            }
+        });
+
+        ff.on('error', err => reject(err));
+    });
+}
+
 // ─── EXPRESS ──────────────────────────────────────────────────────────────────
 
 const app = express();
 
-// ── /messages (compatibilidad sketch anterior) ──
+// Middleware para recibir audio crudo (WAV) en el body — hasta 5MB
+app.use('/send-audio', express.raw({ type: '*/*', limit: '5mb' }));
+
+// ── /messages ──
 app.get('/messages', (req, res) => {
     const since = parseInt(req.query.since) || 0;
     res.json({ count: messageQueue.filter(m => m.id > since).length,
         messages: messageQueue.filter(m => m.id > since) });
 });
 
-// ── /chats — lista de conversaciones ──
+// ── /chats ──
 app.get('/chats', (req, res) => {
     const list = Object.values(chats).map(c => ({
         number:   c.number,
@@ -127,7 +165,7 @@ app.get('/chats', (req, res) => {
     res.json({ count: list.length, chats: list });
 });
 
-// ── /chats/:number — historial ──
+// ── /chats/:number ──
 app.get('/chats/:number', (req, res) => {
     const num   = req.params.number;
     const limit = parseInt(req.query.limit) || 30;
@@ -136,6 +174,43 @@ app.get('/chats/:number', (req, res) => {
     chats[num].unread = 0;
     res.json({ number: chat.number, name: chat.name, unread: 0,
         messages: chat.messages.slice(-limit) });
+});
+
+// ── /send-audio?to=NUMERO — recibe WAV, convierte a Opus, envía por WhatsApp ──
+app.post('/send-audio', async (req, res) => {
+    const to = req.query.to;
+
+    if (!to || !CONFIG.allowedNumbers.includes(to)) {
+        return res.status(400).json({ error: 'Número inválido o no permitido' });
+    }
+    if (!sockRef || !global.waConnected) {
+        return res.status(503).json({ error: 'WhatsApp no conectado' });
+    }
+    if (!req.body || req.body.length === 0) {
+        return res.status(400).json({ error: 'Sin audio en el body' });
+    }
+
+    logger.info({ to, bytes: req.body.length }, 'Audio recibido, convirtiendo...');
+
+    try {
+        const oggBuffer = await wavToOpus(req.body);
+        const jid = to + '@s.whatsapp.net';
+
+        await sockRef.sendMessage(jid, {
+            audio: oggBuffer,
+            ptt: true,                              // nota de voz
+            mimetype: 'audio/ogg; codecs=opus',
+        });
+
+        // Registrar en el historial como mensaje propio
+        addToChat(to, to, '[audio enviado]', Math.floor(Date.now() / 1000), true);
+
+        logger.info({ to }, 'Audio enviado ✅');
+        res.json({ ok: true });
+    } catch (err) {
+        logger.error({ err: err.message }, 'Error enviando audio');
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ── /status ──
@@ -192,6 +267,8 @@ async function connectToWhatsApp() {
         syncFullHistory: false, markOnlineOnConnect: false,
     });
 
+    sockRef = sock;   // guardar referencia global para enviar mensajes
+
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('contacts.upsert', (contacts) => {
@@ -224,16 +301,11 @@ async function connectToWhatsApp() {
     });
 
     sock.ev.on('messages.upsert', ({ messages, type }) => {
-        console.log('>>> upsert:', type);
-        for (const m of messages) {
-            console.log('>>> key completo:', JSON.stringify(m.key, null, 2));
-        }
         if (type !== 'notify') return;
 
         for (const msg of messages) {
             let jid = msg.key.remoteJid;
 
-            // Resolver LID
             if (jid.endsWith('@lid')) {
                 const alt = msg.key.remoteJidAlt || msg.key.senderPn;
                 if (alt) { jid = alt; }

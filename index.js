@@ -19,6 +19,13 @@ const path = require('path');
 
 require('dotenv').config();
 
+const { createClient } = require('@supabase/supabase-js');
+
+// Cliente de Supabase (opcional: si no hay credenciales, funciona solo en memoria)
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_KEY)
+    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+    : null;
+
 const CONFIG = {
     allowedNumbers: (process.env.ALLOWED_NUMBERS || '')
         .split(',')
@@ -94,6 +101,19 @@ function addToChat(number, name, text, ts, fromMe) {
         chat.messages.shift();
     }
 
+    // Guardar en Supabase (sin bloquear)
+    if (supabase) {
+        supabase.from('mensajes').insert({
+            numero: number,
+            nombre: chat.name,
+            texto: text,
+            ts: ts,
+            from_me: fromMe || false,
+        }).then(({ error }) => {
+            if (error) logger.warn({ err: error.message }, 'Error guardando en Supabase');
+        });
+    }
+
     if (!fromMe) {
         chat.unread += 1;
         lastMessageId += 1;
@@ -142,6 +162,77 @@ function wavToOpus(wavBuffer) {
 
         ff.on('error', err => reject(err));
     });
+}
+
+const DIA_MS = 24 * 60 * 60 * 1000;
+
+// Carga el historial reciente desde Supabase al arrancar el servidor
+async function cargarHistorial() {
+    if (!supabase) return;
+    try {
+        // Traer mensajes de los ultimos 20 dias, ordenados por fecha
+        const desde = Math.floor((Date.now() - 20 * DIA_MS) / 1000);
+        const { data, error } = await supabase
+            .from('mensajes')
+            .select('*')
+            .gte('ts', desde)
+            .order('ts', { ascending: true });
+
+        if (error) { logger.warn({ err: error.message }, 'No se pudo cargar historial'); return; }
+
+        for (const m of (data || [])) {
+            const num = m.numero;
+            if (!chats[num]) {
+                chats[num] = { number: num, name: m.nombre || num, unread: 0, messages: [] };
+            }
+            globalMsgId += 1;
+            chats[num].messages.push({ id: globalMsgId, text: m.texto, ts: m.ts, fromMe: m.from_me });
+            if (CONFIG.nombres[num]) chats[num].name = CONFIG.nombres[num];
+            else if (m.nombre) chats[num].name = m.nombre;
+        }
+        // Recortar cada chat al maximo en memoria
+        for (const num of Object.keys(chats)) {
+            const msgs = chats[num].messages;
+            if (msgs.length > CONFIG.maxMessagesPerChat) {
+                chats[num].messages = msgs.slice(-CONFIG.maxMessagesPerChat);
+            }
+        }
+        logger.info({ chats: Object.keys(chats).length }, 'Historial cargado desde Supabase');
+    } catch (e) {
+        logger.warn({ err: e.message }, 'Error cargando historial');
+    }
+}
+
+// Limpieza con retencion: cuando el mensaje mas viejo supera los 20 dias,
+// borra todo lo anterior a los ultimos 5 dias. Oscila entre 5 y 20 dias.
+async function limpiarHistorial() {
+    if (!supabase) return;
+    try {
+        // Buscar el mensaje mas antiguo
+        const { data: viejos } = await supabase
+            .from('mensajes')
+            .select('ts')
+            .order('ts', { ascending: true })
+            .limit(1);
+
+        if (!viejos || viejos.length === 0) return;
+
+        const masViejo = viejos[0].ts * 1000;
+        const edad = Date.now() - masViejo;
+
+        // Si el mas viejo supera los 20 dias, recortar a los ultimos 5
+        if (edad >= 20 * DIA_MS) {
+            const corte = Math.floor((Date.now() - 5 * DIA_MS) / 1000);
+            const { error } = await supabase
+                .from('mensajes')
+                .delete()
+                .lt('ts', corte);
+            if (error) logger.warn({ err: error.message }, 'Error en limpieza');
+            else logger.info('Historial recortado a los ultimos 5 dias');
+        }
+    } catch (e) {
+        logger.warn({ err: e.message }, 'Error en limpieza de historial');
+    }
 }
 
 const app = express();
@@ -404,3 +495,8 @@ connectToWhatsApp().catch(err => {
     logger.error(err, 'Error fatal al iniciar');
     process.exit(1);
 });
+
+// Cargar historial guardado y programar la limpieza diaria
+cargarHistorial();
+limpiarHistorial();
+setInterval(limpiarHistorial, DIA_MS);   // revisar una vez al dia

@@ -141,6 +141,7 @@ app.get('/messages', (req, res) => {
 });
 
 app.get('/chats', (req, res) => {
+    // Chats que ya tienen conversacion
     const list = Object.values(chats).map(c => ({
         number: c.number,
         name: c.name,
@@ -148,6 +149,15 @@ app.get('/chats', (req, res) => {
         lastText: c.messages.length > 0 ? c.messages[c.messages.length - 1].text : '',
         lastTs: c.messages.length > 0 ? c.messages[c.messages.length - 1].ts : 0,
     }));
+
+    // Anadir los numeros de la whitelist que aun no tienen conversacion
+    for (const num of CONFIG.allowedNumbers) {
+        if (!chats[num]) {
+            list.push({ number: num, name: num, unread: 0, lastText: '', lastTs: 0 });
+        }
+    }
+
+    // Ordenar: primero los que tienen mensajes recientes, luego los vacios
     list.sort((a, b) => b.lastTs - a.lastTs);
     res.json({ count: list.length, chats: list });
 });

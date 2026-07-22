@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Instalar ffmpeg para convertir audio WAV → Opus (notas de voz de WhatsApp)
 RUN apt-get update && \

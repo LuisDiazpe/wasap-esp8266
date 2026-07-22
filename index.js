@@ -166,6 +166,42 @@ function wavToOpus(wavBuffer) {
 
 const DIA_MS = 24 * 60 * 60 * 1000;
 
+// Transcribe un buffer de audio OGG usando la API de Groq (Whisper).
+// Devuelve el texto o null si falla.
+async function transcribirAudio(oggBuffer) {
+    if (!process.env.GROQ_API_KEY) {
+        logger.warn('Falta GROQ_API_KEY, no se puede transcribir');
+        return null;
+    }
+    try {
+        const form = new FormData();
+        const blob = new Blob([oggBuffer], { type: 'audio/ogg' });
+        form.append('file', blob, 'audio.ogg');
+        form.append('model', 'whisper-large-v3-turbo');
+        form.append('language', 'es');
+        form.append('response_format', 'text');
+
+        const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + process.env.GROQ_API_KEY },
+            body: form,
+        });
+
+        if (!resp.ok) {
+            const err = await resp.text();
+            logger.warn({ status: resp.status, err: err.slice(0, 200) }, 'Groq fallo');
+            return null;
+        }
+        const texto = (await resp.text()).trim();
+        logger.info({ texto: texto.slice(0, 60) }, 'Audio transcrito');
+        return texto;
+    } catch (e) {
+        logger.warn({ err: e.message }, 'Error transcribiendo');
+        return null;
+    }
+}
+
+
 // Carga el historial reciente desde Supabase al arrancar el servidor
 async function cargarHistorial() {
     if (!supabase) return;
@@ -286,6 +322,7 @@ app.get('/chats/:number', (req, res) => {
 app.post('/send-audio', (req, res) => {
     const to = req.query.to;
     const sampleRate = parseInt(req.query.rate) || 16000;
+    const modo = req.query.modo || 'audio';
 
     if (!to || !CONFIG.allowedNumbers.includes(to)) {
         return res.status(400).json({ error: 'Numero invalido o no permitido' });

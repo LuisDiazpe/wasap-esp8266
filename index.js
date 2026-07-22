@@ -200,13 +200,17 @@ app.post('/send-audio', (req, res) => {
     let ffErr = '';
     ff.stderr.on('data', d => { ffErr += d.toString(); });
 
-    // El audio del ESP entra por req y se lo pasamos a ffmpeg en vivo
-    // Contar bytes que llegan del ESP (diagnostico)
+    // Node desempaqueta el chunked automaticamente en los eventos 'data'.
+    // Escribimos cada trozo de PCM a ffmpeg a medida que llega.
     let bytesRecibidos = 0;
-    req.on('data', d => { bytesRecibidos += d.length; });
-    req.on('end', () => { logger.info({ bytesRecibidos }, 'Total PCM recibido del ESP'); });
-
-    req.pipe(ff.stdin);
+    req.on('data', chunk => {
+        bytesRecibidos += chunk.length;
+        ff.stdin.write(chunk);
+    });
+    req.on('end', () => {
+        logger.info({ bytesRecibidos }, 'PCM recibido del ESP');
+        ff.stdin.end();
+    });
 
     req.on('error', () => { try { ff.stdin.end(); } catch (e) {} });
 

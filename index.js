@@ -201,6 +201,11 @@ app.post('/send-audio', (req, res) => {
     ff.stderr.on('data', d => { ffErr += d.toString(); });
 
     // El audio del ESP entra por req y se lo pasamos a ffmpeg en vivo
+    // Contar bytes que llegan del ESP (diagnostico)
+    let bytesRecibidos = 0;
+    req.on('data', d => { bytesRecibidos += d.length; });
+    req.on('end', () => { logger.info({ bytesRecibidos }, 'Total PCM recibido del ESP'); });
+
     req.pipe(ff.stdin);
 
     req.on('error', () => { try { ff.stdin.end(); } catch (e) {} });

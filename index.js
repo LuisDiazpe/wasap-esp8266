@@ -24,6 +24,16 @@ const CONFIG = {
         .split(',')
         .map(n => n.trim())
         .filter(Boolean),
+    // Mapa numero->apodo, formato: "numero:apodo,numero:apodo"
+    nombres: (process.env.NOMBRES || '')
+        .split(',')
+        .map(p => p.trim())
+        .filter(Boolean)
+        .reduce((acc, par) => {
+            const [num, nombre] = par.split(':');
+            if (num && nombre) acc[num.trim()] = nombre.trim();
+            return acc;
+        }, {}),
     maxMessagesPerChat: 50,
     port: process.env.PORT || 3000,
     authFolder: process.env.AUTH_FOLDER || './auth_session',
@@ -61,17 +71,21 @@ function extractText(msg) {
 }
 
 function addToChat(number, name, text, ts, fromMe) {
+    const apodo = CONFIG.nombres[number];
+
     if (!chats[number]) {
         chats[number] = {
             number,
-            name: (!fromMe && name) ? name : number,
+            name: apodo || ((!fromMe && name) ? name : number),
             unread: 0,
             messages: [],
         };
     }
 
     const chat = chats[number];
-    if (!fromMe && name && name !== number) chat.name = name;
+    // El apodo configurado siempre tiene prioridad
+    if (apodo) chat.name = apodo;
+    else if (!fromMe && name && name !== number) chat.name = name;
 
     globalMsgId += 1;
     chat.messages.push({ id: globalMsgId, text, ts, fromMe: fromMe || false });
@@ -153,7 +167,7 @@ app.get('/chats', (req, res) => {
     // Anadir los numeros de la whitelist que aun no tienen conversacion
     for (const num of CONFIG.allowedNumbers) {
         if (!chats[num]) {
-            list.push({ number: num, name: num, unread: 0, lastText: '', lastTs: 0 });
+            list.push({ number: num, name: CONFIG.nombres[num] || num, unread: 0, lastText: '', lastTs: 0 });
         }
     }
 

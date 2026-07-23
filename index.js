@@ -374,6 +374,19 @@ app.post('/send-audio', (req, res) => {
         try {
             const ogg = Buffer.concat(chunks);
             const jid = to + '@s.whatsapp.net';
+
+            if (modo === 'texto') {
+                const texto = await transcribirAudio(ogg);
+                if (!texto || texto.length === 0) {
+                    logger.warn({ to }, 'Transcripcion vacia');
+                    return res.status(500).json({ error: 'No se pudo transcribir' });
+                }
+                await sockRef.sendMessage(jid, { text: texto });
+                addToChat(to, to, texto, Math.floor(Date.now() / 1000), true);
+                logger.info({ to, texto: texto.slice(0, 40) }, 'Texto transcrito enviado');
+                return res.json({ ok: true, texto });
+            }
+
             await sockRef.sendMessage(jid, {
                 audio: ogg,
                 ptt: true,
@@ -383,7 +396,7 @@ app.post('/send-audio', (req, res) => {
             logger.info({ to, bytes: ogg.length }, 'Audio enviado');
             res.json({ ok: true });
         } catch (err) {
-            logger.error({ err: err.message }, 'Error enviando audio');
+            logger.error({ err: err.message }, 'Error enviando');
             res.status(500).json({ error: err.message });
         }
     });

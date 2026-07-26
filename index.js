@@ -6,7 +6,10 @@ const {
     useMultiFileAuthState,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
+    downloadMediaMessage,
 } = require('@whiskeysockets/baileys');
+
+const { aBitmapOLED } = require('./imagen');
 
 const express = require('express');
 const qrcode = require('qrcode-terminal');
@@ -50,6 +53,12 @@ const CONFIG = {
 const chats = {};
 let globalMsgId = 0;
 
+// Imagenes convertidas para la OLED: id -> { mini, full, ms }
+// mini y full son { w, h, frames: [Buffer] }
+const medias = {};
+let mediaId = 0;
+const MAX_MEDIAS = 30;
+
 const messageQueue = [];
 let lastMessageId = 0;
 let currentQR = null;
@@ -77,7 +86,7 @@ function extractText(msg) {
     );
 }
 
-function addToChat(number, name, text, ts, fromMe) {
+function addToChat(number, name, text, ts, fromMe, tipo, mid) {
     const apodo = CONFIG.nombres[number];
 
     if (!chats[number]) {
@@ -95,7 +104,10 @@ function addToChat(number, name, text, ts, fromMe) {
     else if (!fromMe && name && name !== number) chat.name = name;
 
     globalMsgId += 1;
-    chat.messages.push({ id: globalMsgId, text, ts, fromMe: fromMe || false });
+    const entrada = { id: globalMsgId, text, ts, fromMe: fromMe || false };
+    if (tipo && tipo !== 'texto') entrada.tipo = tipo;
+    if (mid) entrada.media = mid;
+    chat.messages.push(entrada);
 
     if (chat.messages.length > CONFIG.maxMessagesPerChat) {
         chat.messages.shift();
@@ -271,6 +283,40 @@ async function limpiarHistorial() {
     }
 }
 
+// Descarga una imagen o sticker de WhatsApp y lo convierte a mapas de bits
+// para la OLED: una miniatura para el chat y una version a pantalla completa.
+// Los stickers animados guardan varios frames.
+async function procesarMedia(msg, sock, animado) {
+    try {
+        const buffer = await downloadMediaMessage(
+            msg, 'buffer', {},
+            { logger: silentLogger, reuploadRequest: sock.updateMediaMessage }
+        );
+        if (!buffer || buffer.length === 0) return null;
+
+        const maxFrames = animado ? 12 : 1;
+        const mini = await aBitmapOLED(buffer, 40, 40, maxFrames);
+        const full = await aBitmapOLED(buffer, 128, 64, maxFrames);
+
+        mediaId += 1;
+        const id = String(mediaId);
+        medias[id] = { mini, full, ms: Date.now() };
+
+        // Limitar cuantas imagenes guardamos en memoria
+        const ids = Object.keys(medias);
+        if (ids.length > MAX_MEDIAS) {
+            ids.sort((a, b) => medias[a].ms - medias[b].ms);
+            delete medias[ids[0]];
+        }
+
+        logger.info({ id, frames: full.frames.length }, 'Media convertida');
+        return id;
+    } catch (e) {
+        logger.warn({ err: e.message }, 'No se pudo procesar la media');
+        return null;
+    }
+}
+
 const app = express();
 
 // El audio en streaming se maneja directamente como stream en el endpoint
@@ -407,6 +453,32 @@ app.post('/send-audio', (req, res) => {
     });
 });
 
+// Informacion de una imagen: tamano y cuantos frames tiene
+app.get('/media/:id/info', (req, res) => {
+    const m = medias[req.params.id];
+    if (!m) return res.status(404).json({ error: 'No existe' });
+    res.json({
+        id: req.params.id,
+        mini: { w: m.mini.w, h: m.mini.h, bytes: m.mini.frames[0].length },
+        full: { w: m.full.w, h: m.full.h, bytes: m.full.frames[0].length },
+        frames: m.full.frames.length,
+    });
+});
+
+// Devuelve un frame como mapa de bits crudo, listo para drawBitmap.
+// size = mini | full     n = numero de frame (0 por defecto)
+app.get('/media/:id/frame', (req, res) => {
+    const m = medias[req.params.id];
+    if (!m) return res.status(404).end();
+
+    const cual = req.query.size === 'full' ? m.full : m.mini;
+    const n = parseInt(req.query.n) || 0;
+    if (n < 0 || n >= cual.frames.length) return res.status(404).end();
+
+    res.set('Content-Type', 'application/octet-stream');
+    res.send(cual.frames[n]);
+});
+
 app.get('/status', (req, res) => {
     res.json({
         connected: global.waConnected || false,
@@ -505,7 +577,7 @@ async function connectToWhatsApp() {
         }
     });
 
-    sock.ev.on('messages.upsert', ({ messages, type }) => {
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
@@ -527,14 +599,31 @@ async function connectToWhatsApp() {
             const number = jidToNumber(jid);
             if (!CONFIG.allowedNumbers.includes(number)) continue;
 
-            const text = extractText(msg);
-            if (!text) continue;
-
             const ts = Math.floor(msg.messageTimestamp || Date.now() / 1000);
             const fromMe = msg.key.fromMe || false;
             const name = msg.pushName || number;
 
-            addToChat(number, name, text, ts, fromMe);
+            const m = msg.message || {};
+
+            // Imagen o sticker: descargar y convertir para la OLED
+            if (m.imageMessage || m.stickerMessage) {
+                const esSticker = !!m.stickerMessage;
+                const animado = esSticker && !!m.stickerMessage.isAnimated;
+                const mid = await procesarMedia(msg, sock, animado);
+
+                const etiqueta = esSticker
+                    ? (animado ? '[sticker animado]' : '[sticker]')
+                    : (m.imageMessage.caption || '[imagen]');
+
+                addToChat(number, name, etiqueta, ts, fromMe,
+                    esSticker ? 'sticker' : 'imagen', mid);
+                continue;
+            }
+
+            const text = extractText(msg);
+            if (!text) continue;
+
+            addToChat(number, name, text, ts, fromMe, 'texto', null);
         }
     });
 

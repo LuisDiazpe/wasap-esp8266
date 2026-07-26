@@ -10,7 +10,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-COPY index.js ./
+COPY index.js imagen.js ./
 
 RUN mkdir -p /app/auth_session
 

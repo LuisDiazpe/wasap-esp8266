@@ -121,6 +121,8 @@ function addToChat(number, name, text, ts, fromMe, tipo, mid) {
             texto: text,
             ts: ts,
             from_me: fromMe || false,
+            tipo: (tipo && tipo !== 'texto') ? tipo : null,
+            media: mid || null,
         }).then(({ error }) => {
             if (error) logger.warn({ err: error.message }, 'Error guardando en Supabase');
         });
@@ -234,7 +236,10 @@ async function cargarHistorial() {
                 chats[num] = { number: num, name: m.nombre || num, unread: 0, messages: [] };
             }
             globalMsgId += 1;
-            chats[num].messages.push({ id: globalMsgId, text: m.texto, ts: m.ts, fromMe: m.from_me });
+            const entrada = { id: globalMsgId, text: m.texto, ts: m.ts, fromMe: m.from_me };
+            if (m.tipo) entrada.tipo = m.tipo;
+            if (m.media) entrada.media = m.media;
+            chats[num].messages.push(entrada);
             if (CONFIG.nombres[num]) chats[num].name = CONFIG.nombres[num];
             else if (m.nombre) chats[num].name = m.nombre;
         }
@@ -248,6 +253,37 @@ async function cargarHistorial() {
         logger.info({ chats: Object.keys(chats).length }, 'Historial cargado desde Supabase');
     } catch (e) {
         logger.warn({ err: e.message }, 'Error cargando historial');
+    }
+}
+
+// Carga las imagenes convertidas desde Supabase al arrancar
+async function cargarMedias() {
+    if (!supabase) return;
+    try {
+        const { data, error } = await supabase
+            .from('medias')
+            .select('*')
+            .order('created_at', { ascending: false })
+            .limit(MAX_MEDIAS);
+
+        if (error) { logger.warn({ err: error.message }, 'No se pudo cargar medias'); return; }
+
+        let maxId = 0;
+        for (const m of (data || [])) {
+            medias[m.id] = {
+                mini: { w: 40, h: 40,
+                    frames: m.mini_frames.map(b => Buffer.from(b, 'base64')) },
+                full: { w: 128, h: 64,
+                    frames: m.full_frames.map(b => Buffer.from(b, 'base64')) },
+                ms: new Date(m.created_at).getTime(),
+            };
+            const n = parseInt(m.id);
+            if (!isNaN(n) && n > maxId) maxId = n;
+        }
+        if (maxId > mediaId) mediaId = maxId;
+        logger.info({ medias: Object.keys(medias).length }, 'Medias cargadas desde Supabase');
+    } catch (e) {
+        logger.warn({ err: e.message }, 'Error cargando medias');
     }
 }
 
@@ -277,6 +313,10 @@ async function limpiarHistorial() {
                 .lt('ts', corte);
             if (error) logger.warn({ err: error.message }, 'Error en limpieza');
             else logger.info('Historial recortado a los ultimos 5 dias');
+
+            // Limpiar tambien las imagenes viejas
+            const corteFecha = new Date(Date.now() - 5 * DIA_MS).toISOString();
+            await supabase.from('medias').delete().lt('created_at', corteFecha);
         }
     } catch (e) {
         logger.warn({ err: e.message }, 'Error en limpieza de historial');
@@ -309,6 +349,18 @@ async function procesarMedia(msg, sock, animado, esSticker) {
         if (ids.length > MAX_MEDIAS) {
             ids.sort((a, b) => medias[a].ms - medias[b].ms);
             delete medias[ids[0]];
+        }
+
+        // Persistir en Supabase para sobrevivir reinicios
+        if (supabase) {
+            supabase.from('medias').insert({
+                id,
+                mini_frames: mini.frames.map(f => f.toString('base64')),
+                full_frames: full.frames.map(f => f.toString('base64')),
+                frames: full.frames.length,
+            }).then(({ error }) => {
+                if (error) logger.warn({ err: error.message }, 'Error guardando media');
+            });
         }
 
         logger.info({ id, frames: full.frames.length }, 'Media convertida');
@@ -639,5 +691,6 @@ connectToWhatsApp().catch(err => {
 
 // Cargar historial guardado y programar la limpieza diaria
 cargarHistorial();
+cargarMedias();
 limpiarHistorial();
 setInterval(limpiarHistorial, DIA_MS);   // revisar una vez al dia

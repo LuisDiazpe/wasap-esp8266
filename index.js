@@ -286,7 +286,7 @@ async function limpiarHistorial() {
 // Descarga una imagen o sticker de WhatsApp y lo convierte a mapas de bits
 // para la OLED: una miniatura para el chat y una version a pantalla completa.
 // Los stickers animados guardan varios frames.
-async function procesarMedia(msg, sock, animado) {
+async function procesarMedia(msg, sock, animado, esSticker) {
     try {
         const buffer = await downloadMediaMessage(
             msg, 'buffer', {},
@@ -295,8 +295,10 @@ async function procesarMedia(msg, sock, animado) {
         if (!buffer || buffer.length === 0) return null;
 
         const maxFrames = animado ? 12 : 1;
-        const mini = await aBitmapOLED(buffer, 40, 40, maxFrames);
-        const full = await aBitmapOLED(buffer, 128, 64, maxFrames);
+        // Stickers y memes se ven mejor con alto contraste; las fotos con dithering
+        const modo = esSticker ? 'contraste' : 'foto';
+        const mini = await aBitmapOLED(buffer, 40, 40, maxFrames, modo);
+        const full = await aBitmapOLED(buffer, 128, 64, maxFrames, modo);
 
         mediaId += 1;
         const id = String(mediaId);
@@ -609,7 +611,7 @@ async function connectToWhatsApp() {
             if (m.imageMessage || m.stickerMessage) {
                 const esSticker = !!m.stickerMessage;
                 const animado = esSticker && !!m.stickerMessage.isAnimated;
-                const mid = await procesarMedia(msg, sock, animado);
+                const mid = await procesarMedia(msg, sock, animado, esSticker);
 
                 const etiqueta = esSticker
                     ? (animado ? '[sticker animado]' : '[sticker]')
